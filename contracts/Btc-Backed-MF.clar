@@ -11,6 +11,9 @@
 (define-constant ERR_NO_CLAIM_CONDITIONS (err u109))
 (define-constant ERR_POLICY_LIMIT_REACHED (err u110))
 (define-constant ERR_POLICY_ALREADY_CANCELLED (err u111))
+(define-constant ERR_POLICY_NOT_FOR_SALE (err u112))
+(define-constant ERR_TRANSFER_TO_SELF (err u113))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u114))
 
 (define-constant MIN_PREMIUM u1000000)
 (define-constant MAX_PREMIUM u100000000)
@@ -51,6 +54,12 @@
     timestamp: uint
 })
 
+(define-map policy-transfers uint {
+    seller: principal,
+    asking-price: uint,
+    active: bool
+})
+
 (define-read-only (get-policy (policy-id uint))
     (map-get? policies policy-id)
 )
@@ -74,6 +83,17 @@
 
 (define-read-only (get-weather-data (lat int) (lng int) (report-height uint))
     (map-get? weather-data {location-lat: lat, location-lng: lng, report-height: report-height})
+)
+
+(define-read-only (get-policy-transfer (policy-id uint))
+    (map-get? policy-transfers policy-id)
+)
+
+(define-read-only (is-policy-for-sale (policy-id uint))
+    (match (map-get? policy-transfers policy-id)
+        transfer (get active transfer)
+        false
+    )
 )
 
 (define-public (authorize-oracle (oracle principal))
@@ -189,6 +209,72 @@
     (begin
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (ok amount)
+    )
+)
+
+(define-public (list-policy-for-sale (policy-id uint) (asking-price uint))
+    (let (
+        (policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
+    )
+        (asserts! (is-eq tx-sender (get farmer policy)) ERR_UNAUTHORIZED)
+        (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
+        (asserts! (not (get claimed policy)) ERR_POLICY_ALREADY_CLAIMED)
+        (asserts! (not (get cancelled policy)) ERR_POLICY_ALREADY_CANCELLED)
+        (asserts! (> asking-price u0) ERR_INVALID_PARAMS)
+        
+        (map-set policy-transfers policy-id {
+            seller: tx-sender,
+            asking-price: asking-price,
+            active: true
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (cancel-policy-sale (policy-id uint))
+    (let (
+        (policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
+        (transfer (unwrap! (map-get? policy-transfers policy-id) ERR_POLICY_NOT_FOR_SALE))
+    )
+        (asserts! (is-eq tx-sender (get seller transfer)) ERR_UNAUTHORIZED)
+        (asserts! (get active transfer) ERR_POLICY_NOT_FOR_SALE)
+        
+        (map-set policy-transfers policy-id (merge transfer {active: false}))
+        
+        (ok true)
+    )
+)
+
+(define-public (purchase-policy (policy-id uint))
+    (let (
+        (policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
+        (transfer (unwrap! (map-get? policy-transfers policy-id) ERR_POLICY_NOT_FOR_SALE))
+        (seller (get seller transfer))
+        (asking-price (get asking-price transfer))
+        (current-user-policies (get-user-policy-count tx-sender))
+    )
+        (asserts! (get active transfer) ERR_POLICY_NOT_FOR_SALE)
+        (asserts! (not (is-eq tx-sender seller)) ERR_TRANSFER_TO_SELF)
+        (asserts! (< current-user-policies MAX_POLICIES_PER_USER) ERR_POLICY_LIMIT_REACHED)
+        (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
+        (asserts! (not (get claimed policy)) ERR_POLICY_ALREADY_CLAIMED)
+        (asserts! (not (get cancelled policy)) ERR_POLICY_ALREADY_CANCELLED)
+        
+        (try! (stx-transfer? asking-price tx-sender seller))
+        
+        (map-set policies policy-id (merge policy {farmer: tx-sender}))
+        (map-set policy-transfers policy-id (merge transfer {active: false}))
+        
+        (let (
+            (seller-policy-count (get-user-policy-count seller))
+            (buyer-policy-count (get-user-policy-count tx-sender))
+        )
+            (map-set user-policy-count seller (- seller-policy-count u1))
+            (map-set user-policy-count tx-sender (+ buyer-policy-count u1))
+        )
+        
+        (ok policy-id)
     )
 )
 
