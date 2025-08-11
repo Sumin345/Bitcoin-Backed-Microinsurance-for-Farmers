@@ -14,6 +14,7 @@
 (define-constant ERR_POLICY_NOT_FOR_SALE (err u112))
 (define-constant ERR_TRANSFER_TO_SELF (err u113))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u114))
+(define-constant ERR_RISK_SCORE_NOT_FOUND (err u115))
 
 (define-constant MIN_PREMIUM u1000000)
 (define-constant MAX_PREMIUM u100000000)
@@ -24,6 +25,9 @@
 (define-constant MAX_POLICIES_PER_USER u50)
 (define-constant DROUGHT_THRESHOLD u10)
 (define-constant FLOOD_THRESHOLD u200)
+(define-constant BASE_RISK_SCORE u50)
+(define-constant MAX_RISK_SCORE u100)
+(define-constant RISK_ADJUSTMENT_FACTOR u10)
 
 (define-data-var policy-counter uint u0)
 (define-data-var total-premiums uint u0)
@@ -58,6 +62,14 @@
     seller: principal,
     asking-price: uint,
     active: bool
+})
+
+(define-map location-risk-scores {lat: int, lng: int} uint)
+
+(define-map location-claim-history {lat: int, lng: int} {
+    total-claims: uint,
+    total-policies: uint,
+    last-claim-height: uint
 })
 
 (define-read-only (get-policy (policy-id uint))
@@ -96,6 +108,24 @@
     )
 )
 
+(define-read-only (get-location-risk-score (lat int) (lng int))
+    (default-to BASE_RISK_SCORE (map-get? location-risk-scores {lat: lat, lng: lng}))
+)
+
+(define-read-only (get-location-claim-history (lat int) (lng int))
+    (default-to {total-claims: u0, total-policies: u0, last-claim-height: u0} 
+                (map-get? location-claim-history {lat: lat, lng: lng}))
+)
+
+(define-read-only (calculate-risk-premium (base-premium uint) (lat int) (lng int))
+    (let (
+        (risk-score (get-location-risk-score lat lng))
+        (adjustment (/ (* base-premium risk-score) u100))
+    )
+        (+ base-premium adjustment)
+    )
+)
+
 (define-public (authorize-oracle (oracle principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -126,6 +156,8 @@
         (user-policies (get-user-policy-count tx-sender))
         (start-block stacks-block-height)
         (end-block (+ stacks-block-height duration))
+        (location-key {lat: lat, lng: lng})
+        (current-history (get-location-claim-history lat lng))
     )
         (asserts! (and (>= premium MIN_PREMIUM) (<= premium MAX_PREMIUM)) ERR_INVALID_PARAMS)
         (asserts! (and (>= coverage MIN_COVERAGE) (<= coverage MAX_COVERAGE)) ERR_INVALID_PARAMS)
@@ -145,6 +177,12 @@
             claimed: false,
             cancelled: false,
             active: true
+        })
+        
+        (map-set location-claim-history location-key {
+            total-claims: (get total-claims current-history),
+            total-policies: (+ (get total-policies current-history) u1),
+            last-claim-height: (get last-claim-height current-history)
         })
         
         (map-set user-policy-count tx-sender (+ user-policies u1))
@@ -179,6 +217,8 @@
         (policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
         (weather (unwrap! (get-weather-data (get latitude policy) (get longitude policy) stacks-block-height) ERR_WEATHER_DATA_NOT_FOUND))
         (rainfall (get rainfall weather))
+        (location-key {lat: (get latitude policy), lng: (get longitude policy)})
+        (current-history (get-location-claim-history (get latitude policy) (get longitude policy)))
     )
         (asserts! (is-eq tx-sender (get farmer policy)) ERR_UNAUTHORIZED)
         (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
@@ -191,6 +231,11 @@
         (try! (as-contract (stx-transfer? (get coverage policy) tx-sender (get farmer policy))))
         
         (map-set policies policy-id (merge policy {claimed: true, active: false}))
+        (map-set location-claim-history location-key {
+            total-claims: (+ (get total-claims current-history) u1),
+            total-policies: (get total-policies current-history),
+            last-claim-height: stacks-block-height
+        })
         (var-set total-payouts (+ (var-get total-payouts) (get coverage policy)))
         
         (ok (get coverage policy))
@@ -275,6 +320,28 @@
         )
         
         (ok policy-id)
+    )
+)
+
+(define-public (update-location-risk-score (lat int) (lng int) (risk-score uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= risk-score MAX_RISK_SCORE) ERR_INVALID_PARAMS)
+        (ok (map-set location-risk-scores {lat: lat, lng: lng} risk-score))
+    )
+)
+
+(define-public (auto-update-risk-score (lat int) (lng int))
+    (let (
+        (history (get-location-claim-history lat lng))
+        (location-policies (get total-policies history))
+        (location-claims (get total-claims history))
+        (claim-rate (if (> location-policies u0) (/ (* location-claims u100) location-policies) u0))
+        (new-risk-score (+ BASE_RISK_SCORE (/ (* claim-rate RISK_ADJUSTMENT_FACTOR) u10)))
+        (final-risk-score (if (> new-risk-score MAX_RISK_SCORE) MAX_RISK_SCORE new-risk-score))
+    )
+        (asserts! (> location-policies u5) ERR_INVALID_PARAMS)
+        (ok (map-set location-risk-scores {lat: lat, lng: lng} final-risk-score))
     )
 )
 
