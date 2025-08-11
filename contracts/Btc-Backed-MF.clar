@@ -15,6 +15,11 @@
 (define-constant ERR_TRANSFER_TO_SELF (err u113))
 (define-constant ERR_INSUFFICIENT_PAYMENT (err u114))
 (define-constant ERR_RISK_SCORE_NOT_FOUND (err u115))
+(define-constant ERR_VALIDATOR_NOT_AUTHORIZED (err u116))
+(define-constant ERR_CLAIM_ALREADY_APPROVED (err u117))
+(define-constant ERR_CLAIM_NOT_PENDING (err u118))
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u119))
+(define-constant ERR_CLAIM_ALREADY_VALIDATED (err u120))
 
 (define-constant MIN_PREMIUM u1000000)
 (define-constant MAX_PREMIUM u100000000)
@@ -28,6 +33,8 @@
 (define-constant BASE_RISK_SCORE u50)
 (define-constant MAX_RISK_SCORE u100)
 (define-constant RISK_ADJUSTMENT_FACTOR u10)
+(define-constant MULTISIG_THRESHOLD u50000000)
+(define-constant REQUIRED_VALIDATORS u3)
 
 (define-data-var policy-counter uint u0)
 (define-data-var total-premiums uint u0)
@@ -71,6 +78,18 @@
     total-policies: uint,
     last-claim-height: uint
 })
+
+(define-map authorized-validators principal bool)
+
+(define-map pending-claims uint {
+    policy-id: uint,
+    farmer: principal,
+    coverage: uint,
+    approvals: uint,
+    status: (string-ascii 10)
+})
+
+(define-map claim-approvals {claim-id: uint, validator: principal} bool)
 
 (define-read-only (get-policy (policy-id uint))
     (map-get? policies policy-id)
@@ -126,6 +145,18 @@
     )
 )
 
+(define-read-only (is-validator-authorized (validator principal))
+    (default-to false (map-get? authorized-validators validator))
+)
+
+(define-read-only (get-pending-claim (claim-id uint))
+    (map-get? pending-claims claim-id)
+)
+
+(define-read-only (has-validator-approved (claim-id uint) (validator principal))
+    (default-to false (map-get? claim-approvals {claim-id: claim-id, validator: validator}))
+)
+
 (define-public (authorize-oracle (oracle principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -137,6 +168,20 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (ok (map-delete authorized-oracles oracle))
+    )
+)
+
+(define-public (authorize-validator (validator principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok (map-set authorized-validators validator true))
+    )
+)
+
+(define-public (revoke-validator (validator principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok (map-delete authorized-validators validator))
     )
 )
 
@@ -219,6 +264,7 @@
         (rainfall (get rainfall weather))
         (location-key {lat: (get latitude policy), lng: (get longitude policy)})
         (current-history (get-location-claim-history (get latitude policy) (get longitude policy)))
+        (coverage (get coverage policy))
     )
         (asserts! (is-eq tx-sender (get farmer policy)) ERR_UNAUTHORIZED)
         (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
@@ -228,17 +274,29 @@
         (asserts! (<= stacks-block-height (get end-block policy)) ERR_POLICY_EXPIRED)
         (asserts! (or (<= rainfall DROUGHT_THRESHOLD) (>= rainfall FLOOD_THRESHOLD)) ERR_NO_CLAIM_CONDITIONS)
         
-        (try! (as-contract (stx-transfer? (get coverage policy) tx-sender (get farmer policy))))
-        
-        (map-set policies policy-id (merge policy {claimed: true, active: false}))
-        (map-set location-claim-history location-key {
-            total-claims: (+ (get total-claims current-history) u1),
-            total-policies: (get total-policies current-history),
-            last-claim-height: stacks-block-height
-        })
-        (var-set total-payouts (+ (var-get total-payouts) (get coverage policy)))
-        
-        (ok (get coverage policy))
+        (if (>= coverage MULTISIG_THRESHOLD)
+            (begin
+                (map-set pending-claims policy-id {
+                    policy-id: policy-id,
+                    farmer: tx-sender,
+                    coverage: coverage,
+                    approvals: u0,
+                    status: "pending"
+                })
+                (ok coverage)
+            )
+            (begin
+                (try! (as-contract (stx-transfer? coverage tx-sender (get farmer policy))))
+                (map-set policies policy-id (merge policy {claimed: true, active: false}))
+                (map-set location-claim-history location-key {
+                    total-claims: (+ (get total-claims current-history) u1),
+                    total-policies: (get total-policies current-history),
+                    last-claim-height: stacks-block-height
+                })
+                (var-set total-payouts (+ (var-get total-payouts) coverage))
+                (ok coverage)
+            )
+        )
     )
 )
 
@@ -342,6 +400,54 @@
     )
         (asserts! (> location-policies u5) ERR_INVALID_PARAMS)
         (ok (map-set location-risk-scores {lat: lat, lng: lng} final-risk-score))
+    )
+)
+
+(define-public (validate-claim (claim-id uint))
+    (let (
+        (claim (unwrap! (map-get? pending-claims claim-id) ERR_CLAIM_NOT_PENDING))
+        (has-approved (has-validator-approved claim-id tx-sender))
+        (current-approvals (get approvals claim))
+    )
+        (asserts! (is-validator-authorized tx-sender) ERR_VALIDATOR_NOT_AUTHORIZED)
+        (asserts! (is-eq (get status claim) "pending") ERR_CLAIM_NOT_PENDING)
+        (asserts! (not has-approved) ERR_CLAIM_ALREADY_APPROVED)
+        
+        (map-set claim-approvals {claim-id: claim-id, validator: tx-sender} true)
+        (map-set pending-claims claim-id (merge claim {
+            approvals: (+ current-approvals u1)
+        }))
+        
+        (ok (+ current-approvals u1))
+    )
+)
+
+(define-public (finalize-claim (claim-id uint))
+    (let (
+        (claim (unwrap! (map-get? pending-claims claim-id) ERR_CLAIM_NOT_PENDING))
+        (policy-id (get policy-id claim))
+        (policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
+        (farmer (get farmer claim))
+        (coverage (get coverage claim))
+        (approvals (get approvals claim))
+        (location-key {lat: (get latitude policy), lng: (get longitude policy)})
+        (current-history (get-location-claim-history (get latitude policy) (get longitude policy)))
+    )
+        (asserts! (is-eq (get status claim) "pending") ERR_CLAIM_NOT_PENDING)
+        (asserts! (>= approvals REQUIRED_VALIDATORS) ERR_INSUFFICIENT_APPROVALS)
+        
+        (try! (as-contract (stx-transfer? coverage tx-sender farmer)))
+        
+        (map-set policies policy-id (merge policy {claimed: true, active: false}))
+        (map-set pending-claims claim-id (merge claim {status: "approved"}))
+        (map-set location-claim-history location-key {
+            total-claims: (+ (get total-claims current-history) u1),
+            total-policies: (get total-policies current-history),
+            last-claim-height: stacks-block-height
+        })
+        (var-set total-payouts (+ (var-get total-payouts) coverage))
+        
+        (ok coverage)
     )
 )
 
