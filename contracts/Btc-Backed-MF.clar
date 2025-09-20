@@ -20,6 +20,8 @@
 (define-constant ERR_CLAIM_NOT_PENDING (err u118))
 (define-constant ERR_INSUFFICIENT_APPROVALS (err u119))
 (define-constant ERR_CLAIM_ALREADY_VALIDATED (err u120))
+(define-constant ERR_POLICY_NOT_EXPIRED (err u121))
+(define-constant ERR_POLICY_ALREADY_RENEWED (err u122))
 
 (define-constant MIN_PREMIUM u1000000)
 (define-constant MAX_PREMIUM u100000000)
@@ -35,6 +37,8 @@
 (define-constant RISK_ADJUSTMENT_FACTOR u10)
 (define-constant MULTISIG_THRESHOLD u50000000)
 (define-constant REQUIRED_VALIDATORS u3)
+(define-constant RENEWAL_DISCOUNT_RATE u10)
+(define-constant MAX_RENEWAL_COUNT u5)
 
 (define-data-var policy-counter uint u0)
 (define-data-var total-premiums uint u0)
@@ -51,7 +55,9 @@
     longitude: int,
     claimed: bool,
     cancelled: bool,
-    active: bool
+    active: bool,
+    renewal-count: uint,
+    parent-policy-id: (optional uint)
 })
 
 (define-map user-policy-count principal uint)
@@ -157,6 +163,15 @@
     (default-to false (map-get? claim-approvals {claim-id: claim-id, validator: validator}))
 )
 
+(define-read-only (calculate-renewal-premium (base-premium uint) (renewal-count uint))
+    (let (
+        (discount (* base-premium RENEWAL_DISCOUNT_RATE))
+        (total-discount (/ (* discount renewal-count) u100))
+    )
+        (- base-premium total-discount)
+    )
+)
+
 (define-public (authorize-oracle (oracle principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -221,7 +236,9 @@
             longitude: lng,
             claimed: false,
             cancelled: false,
-            active: true
+            active: true,
+            renewal-count: u0,
+            parent-policy-id: none
         })
         
         (map-set location-claim-history location-key {
@@ -448,6 +465,60 @@
         (var-set total-payouts (+ (var-get total-payouts) coverage))
         
         (ok coverage)
+    )
+)
+
+(define-public (renew-policy (policy-id uint) (new-premium uint) (new-coverage uint) (new-duration uint))
+    (let (
+        (old-policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
+        (new-policy-id (+ (var-get policy-counter) u1))
+        (user-policies (get-user-policy-count tx-sender))
+        (start-block stacks-block-height)
+        (end-block (+ stacks-block-height new-duration))
+        (current-renewal-count (get renewal-count old-policy))
+        (new-renewal-count (+ current-renewal-count u1))
+        (discounted-premium (calculate-renewal-premium new-premium current-renewal-count))
+        (location-key {lat: (get latitude old-policy), lng: (get longitude old-policy)})
+        (current-history (get-location-claim-history (get latitude old-policy) (get longitude old-policy)))
+    )
+        (asserts! (is-eq tx-sender (get farmer old-policy)) ERR_UNAUTHORIZED)
+        (asserts! (not (get active old-policy)) ERR_POLICY_NOT_EXPIRED)
+        (asserts! (> stacks-block-height (get end-block old-policy)) ERR_POLICY_NOT_EXPIRED)
+        (asserts! (not (get claimed old-policy)) ERR_POLICY_ALREADY_CLAIMED)
+        (asserts! (< current-renewal-count MAX_RENEWAL_COUNT) ERR_POLICY_ALREADY_RENEWED)
+        (asserts! (and (>= new-premium MIN_PREMIUM) (<= new-premium MAX_PREMIUM)) ERR_INVALID_PARAMS)
+        (asserts! (and (>= new-coverage MIN_COVERAGE) (<= new-coverage MAX_COVERAGE)) ERR_INVALID_PARAMS)
+        (asserts! (and (>= new-duration MIN_DURATION) (<= new-duration MAX_DURATION)) ERR_INVALID_PARAMS)
+        (asserts! (< user-policies MAX_POLICIES_PER_USER) ERR_POLICY_LIMIT_REACHED)
+        
+        (try! (stx-transfer? discounted-premium tx-sender (as-contract tx-sender)))
+        
+        (map-set policies new-policy-id {
+            farmer: tx-sender,
+            premium: discounted-premium,
+            coverage: new-coverage,
+            start-block: start-block,
+            end-block: end-block,
+            latitude: (get latitude old-policy),
+            longitude: (get longitude old-policy),
+            claimed: false,
+            cancelled: false,
+            active: true,
+            renewal-count: new-renewal-count,
+            parent-policy-id: (some policy-id)
+        })
+        
+        (map-set location-claim-history location-key {
+            total-claims: (get total-claims current-history),
+            total-policies: (+ (get total-policies current-history) u1),
+            last-claim-height: (get last-claim-height current-history)
+        })
+        
+        (var-set policy-counter new-policy-id)
+        (var-set total-premiums (+ (var-get total-premiums) discounted-premium))
+        (var-set total-policies (+ (var-get total-policies) u1))
+        
+        (ok new-policy-id)
     )
 )
 
