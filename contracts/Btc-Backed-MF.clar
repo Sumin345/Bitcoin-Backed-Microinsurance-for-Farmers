@@ -22,6 +22,12 @@
 (define-constant ERR_CLAIM_ALREADY_VALIDATED (err u120))
 (define-constant ERR_POLICY_NOT_EXPIRED (err u121))
 (define-constant ERR_POLICY_ALREADY_RENEWED (err u122))
+(define-constant ERR_POOL_NOT_FOUND (err u123))
+(define-constant ERR_ALREADY_POOL_MEMBER (err u124))
+(define-constant ERR_NOT_POOL_MEMBER (err u125))
+(define-constant ERR_POOL_FULL (err u126))
+(define-constant ERR_INSUFFICIENT_POOL_BALANCE (err u127))
+(define-constant ERR_POOL_NOT_ACTIVE (err u128))
 
 (define-constant MIN_PREMIUM u1000000)
 (define-constant MAX_PREMIUM u100000000)
@@ -39,11 +45,15 @@
 (define-constant REQUIRED_VALIDATORS u3)
 (define-constant RENEWAL_DISCOUNT_RATE u10)
 (define-constant MAX_RENEWAL_COUNT u5)
+(define-constant MAX_POOL_MEMBERS u20)
+(define-constant MIN_POOL_CONTRIBUTION u500000)
+(define-constant POOL_DISCOUNT_RATE u20)
 
 (define-data-var policy-counter uint u0)
 (define-data-var total-premiums uint u0)
 (define-data-var total-payouts uint u0)
 (define-data-var total-policies uint u0)
+(define-data-var pool-counter uint u0)
 
 (define-map policies uint {
     farmer: principal,
@@ -96,6 +106,26 @@
 })
 
 (define-map claim-approvals {claim-id: uint, validator: principal} bool)
+
+(define-map community-pools uint {
+    creator: principal,
+    total-balance: uint,
+    member-count: uint,
+    max-members: uint,
+    created-at: uint,
+    active: bool,
+    total-contributions: uint,
+    total-claims-paid: uint
+})
+
+(define-map pool-members {pool-id: uint, member: principal} {
+    contribution: uint,
+    joined-at: uint,
+    policies-created: uint,
+    claims-received: uint
+})
+
+(define-map member-pools principal (list 10 uint))
 
 (define-read-only (get-policy (policy-id uint))
     (map-get? policies policy-id)
@@ -169,6 +199,30 @@
         (total-discount (/ (* discount renewal-count) u100))
     )
         (- base-premium total-discount)
+    )
+)
+
+(define-read-only (get-community-pool (pool-id uint))
+    (map-get? community-pools pool-id)
+)
+
+(define-read-only (get-pool-member (pool-id uint) (member principal))
+    (map-get? pool-members {pool-id: pool-id, member: member})
+)
+
+(define-read-only (get-member-pools (member principal))
+    (default-to (list) (map-get? member-pools member))
+)
+
+(define-read-only (is-pool-member (pool-id uint) (member principal))
+    (is-some (map-get? pool-members {pool-id: pool-id, member: member}))
+)
+
+(define-read-only (calculate-pool-premium (base-premium uint))
+    (let (
+        (discount (/ (* base-premium POOL_DISCOUNT_RATE) u100))
+    )
+        (- base-premium discount)
     )
 )
 
@@ -519,6 +573,183 @@
         (var-set total-policies (+ (var-get total-policies) u1))
         
         (ok new-policy-id)
+    )
+)
+
+(define-public (create-community-pool (max-members uint))
+    (let (
+        (pool-id (+ (var-get pool-counter) u1))
+    )
+        (asserts! (and (> max-members u0) (<= max-members MAX_POOL_MEMBERS)) ERR_INVALID_PARAMS)
+        
+        (map-set community-pools pool-id {
+            creator: tx-sender,
+            total-balance: u0,
+            member-count: u0,
+            max-members: max-members,
+            created-at: stacks-block-height,
+            active: true,
+            total-contributions: u0,
+            total-claims-paid: u0
+        })
+        
+        (var-set pool-counter pool-id)
+        (ok pool-id)
+    )
+)
+
+(define-public (join-community-pool (pool-id uint) (contribution uint))
+    (let (
+        (pool (unwrap! (map-get? community-pools pool-id) ERR_POOL_NOT_FOUND))
+        (member-pool-list (get-member-pools tx-sender))
+    )
+        (asserts! (get active pool) ERR_POOL_NOT_ACTIVE)
+        (asserts! (< (get member-count pool) (get max-members pool)) ERR_POOL_FULL)
+        (asserts! (not (is-pool-member pool-id tx-sender)) ERR_ALREADY_POOL_MEMBER)
+        (asserts! (>= contribution MIN_POOL_CONTRIBUTION) ERR_INVALID_PARAMS)
+        
+        (try! (stx-transfer? contribution tx-sender (as-contract tx-sender)))
+        
+        (map-set pool-members {pool-id: pool-id, member: tx-sender} {
+            contribution: contribution,
+            joined-at: stacks-block-height,
+            policies-created: u0,
+            claims-received: u0
+        })
+        
+        (map-set community-pools pool-id (merge pool {
+            total-balance: (+ (get total-balance pool) contribution),
+            member-count: (+ (get member-count pool) u1),
+            total-contributions: (+ (get total-contributions pool) contribution)
+        }))
+        
+        (map-set member-pools tx-sender 
+            (unwrap-panic (as-max-len? (append member-pool-list pool-id) u10)))
+        
+        (ok true)
+    )
+)
+
+(define-public (create-pool-policy (pool-id uint) (premium uint) (coverage uint) (duration uint) (lat int) (lng int))
+    (let (
+        (pool (unwrap! (map-get? community-pools pool-id) ERR_POOL_NOT_FOUND))
+        (member-data (unwrap! (get-pool-member pool-id tx-sender) ERR_NOT_POOL_MEMBER))
+        (discounted-premium (calculate-pool-premium premium))
+        (policy-id (+ (var-get policy-counter) u1))
+        (user-policies (get-user-policy-count tx-sender))
+        (start-block stacks-block-height)
+        (end-block (+ stacks-block-height duration))
+        (location-key {lat: lat, lng: lng})
+        (current-history (get-location-claim-history lat lng))
+    )
+        (asserts! (get active pool) ERR_POOL_NOT_ACTIVE)
+        (asserts! (and (>= premium MIN_PREMIUM) (<= premium MAX_PREMIUM)) ERR_INVALID_PARAMS)
+        (asserts! (and (>= coverage MIN_COVERAGE) (<= coverage MAX_COVERAGE)) ERR_INVALID_PARAMS)
+        (asserts! (and (>= duration MIN_DURATION) (<= duration MAX_DURATION)) ERR_INVALID_PARAMS)
+        (asserts! (< user-policies MAX_POLICIES_PER_USER) ERR_POLICY_LIMIT_REACHED)
+        (asserts! (>= (get total-balance pool) discounted-premium) ERR_INSUFFICIENT_POOL_BALANCE)
+        
+        (map-set policies policy-id {
+            farmer: tx-sender,
+            premium: discounted-premium,
+            coverage: coverage,
+            start-block: start-block,
+            end-block: end-block,
+            latitude: lat,
+            longitude: lng,
+            claimed: false,
+            cancelled: false,
+            active: true,
+            renewal-count: u0,
+            parent-policy-id: none
+        })
+        
+        (map-set community-pools pool-id (merge pool {
+            total-balance: (- (get total-balance pool) discounted-premium)
+        }))
+        
+        (map-set pool-members {pool-id: pool-id, member: tx-sender} (merge member-data {
+            policies-created: (+ (get policies-created member-data) u1)
+        }))
+        
+        (map-set location-claim-history location-key {
+            total-claims: (get total-claims current-history),
+            total-policies: (+ (get total-policies current-history) u1),
+            last-claim-height: (get last-claim-height current-history)
+        })
+        
+        (map-set user-policy-count tx-sender (+ user-policies u1))
+        (var-set policy-counter policy-id)
+        (var-set total-premiums (+ (var-get total-premiums) discounted-premium))
+        (var-set total-policies (+ (var-get total-policies) u1))
+        
+        (ok policy-id)
+    )
+)
+
+(define-public (claim-from-pool (pool-id uint) (policy-id uint))
+    (let (
+        (pool (unwrap! (map-get? community-pools pool-id) ERR_POOL_NOT_FOUND))
+        (policy (unwrap! (map-get? policies policy-id) ERR_POLICY_NOT_FOUND))
+        (member-data (unwrap! (get-pool-member pool-id tx-sender) ERR_NOT_POOL_MEMBER))
+        (weather (unwrap! (get-weather-data (get latitude policy) (get longitude policy) stacks-block-height) ERR_WEATHER_DATA_NOT_FOUND))
+        (rainfall (get rainfall weather))
+        (coverage (get coverage policy))
+        (location-key {lat: (get latitude policy), lng: (get longitude policy)})
+        (current-history (get-location-claim-history (get latitude policy) (get longitude policy)))
+    )
+        (asserts! (is-eq tx-sender (get farmer policy)) ERR_UNAUTHORIZED)
+        (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
+        (asserts! (not (get claimed policy)) ERR_POLICY_ALREADY_CLAIMED)
+        (asserts! (>= stacks-block-height (get start-block policy)) ERR_POLICY_NOT_ACTIVE)
+        (asserts! (<= stacks-block-height (get end-block policy)) ERR_POLICY_EXPIRED)
+        (asserts! (or (<= rainfall DROUGHT_THRESHOLD) (>= rainfall FLOOD_THRESHOLD)) ERR_NO_CLAIM_CONDITIONS)
+        (asserts! (>= (get total-balance pool) coverage) ERR_INSUFFICIENT_POOL_BALANCE)
+        
+        (try! (as-contract (stx-transfer? coverage tx-sender (get farmer policy))))
+        
+        (map-set policies policy-id (merge policy {claimed: true, active: false}))
+        
+        (map-set community-pools pool-id (merge pool {
+            total-balance: (- (get total-balance pool) coverage),
+            total-claims-paid: (+ (get total-claims-paid pool) coverage)
+        }))
+        
+        (map-set pool-members {pool-id: pool-id, member: tx-sender} (merge member-data {
+            claims-received: (+ (get claims-received member-data) u1)
+        }))
+        
+        (map-set location-claim-history location-key {
+            total-claims: (+ (get total-claims current-history) u1),
+            total-policies: (get total-policies current-history),
+            last-claim-height: stacks-block-height
+        })
+        
+        (var-set total-payouts (+ (var-get total-payouts) coverage))
+        (ok coverage)
+    )
+)
+
+(define-public (withdraw-from-pool (pool-id uint) (amount uint))
+    (let (
+        (pool (unwrap! (map-get? community-pools pool-id) ERR_POOL_NOT_FOUND))
+        (member-data (unwrap! (get-pool-member pool-id tx-sender) ERR_NOT_POOL_MEMBER))
+        (member-contribution (get contribution member-data))
+    )
+        (asserts! (<= amount member-contribution) ERR_INSUFFICIENT_FUNDS)
+        (asserts! (>= (get total-balance pool) amount) ERR_INSUFFICIENT_POOL_BALANCE)
+        
+        (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+        
+        (map-set pool-members {pool-id: pool-id, member: tx-sender} (merge member-data {
+            contribution: (- member-contribution amount)
+        }))
+        
+        (map-set community-pools pool-id (merge pool {
+            total-balance: (- (get total-balance pool) amount)
+        }))
+        
+        (ok amount)
     )
 )
 
