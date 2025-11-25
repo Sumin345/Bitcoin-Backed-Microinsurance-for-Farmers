@@ -28,6 +28,7 @@
 (define-constant ERR_POOL_FULL (err u126))
 (define-constant ERR_INSUFFICIENT_POOL_BALANCE (err u127))
 (define-constant ERR_POOL_NOT_ACTIVE (err u128))
+(define-constant ERR_CROP_TYPE_NOT_FOUND (err u129))
 
 (define-constant MIN_PREMIUM u1000000)
 (define-constant MAX_PREMIUM u100000000)
@@ -36,8 +37,6 @@
 (define-constant MIN_DURATION u144)
 (define-constant MAX_DURATION u52560)
 (define-constant MAX_POLICIES_PER_USER u50)
-(define-constant DROUGHT_THRESHOLD u10)
-(define-constant FLOOD_THRESHOLD u200)
 (define-constant BASE_RISK_SCORE u50)
 (define-constant MAX_RISK_SCORE u100)
 (define-constant RISK_ADJUSTMENT_FACTOR u10)
@@ -67,7 +66,8 @@
     cancelled: bool,
     active: bool,
     renewal-count: uint,
-    parent-policy-id: (optional uint)
+    parent-policy-id: (optional uint),
+    crop-type: (string-ascii 20)
 })
 
 (define-map user-policy-count principal uint)
@@ -96,6 +96,11 @@
 })
 
 (define-map authorized-validators principal bool)
+
+(define-map crop-types (string-ascii 20) {
+    drought-threshold: uint,
+    flood-threshold: uint
+})
 
 (define-map pending-claims uint {
     policy-id: uint,
@@ -254,6 +259,16 @@
     )
 )
 
+(define-public (add-crop-type (name (string-ascii 20)) (drought uint) (flood uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok (map-set crop-types name {
+            drought-threshold: drought,
+            flood-threshold: flood
+        }))
+    )
+)
+
 (define-public (submit-weather-data (lat int) (lng int) (rainfall uint) (temperature uint))
     (begin
         (asserts! (is-oracle-authorized tx-sender) ERR_ORACLE_NOT_AUTHORIZED)
@@ -264,7 +279,7 @@
     )
 )
 
-(define-public (create-policy (premium uint) (coverage uint) (duration uint) (lat int) (lng int))
+(define-public (create-policy (premium uint) (coverage uint) (duration uint) (lat int) (lng int) (crop-type (string-ascii 20)))
     (let (
         (policy-id (+ (var-get policy-counter) u1))
         (user-policies (get-user-policy-count tx-sender))
@@ -273,6 +288,7 @@
         (location-key {lat: lat, lng: lng})
         (current-history (get-location-claim-history lat lng))
     )
+        (asserts! (is-some (map-get? crop-types crop-type)) ERR_CROP_TYPE_NOT_FOUND)
         (asserts! (and (>= premium MIN_PREMIUM) (<= premium MAX_PREMIUM)) ERR_INVALID_PARAMS)
         (asserts! (and (>= coverage MIN_COVERAGE) (<= coverage MAX_COVERAGE)) ERR_INVALID_PARAMS)
         (asserts! (and (>= duration MIN_DURATION) (<= duration MAX_DURATION)) ERR_INVALID_PARAMS)
@@ -292,7 +308,8 @@
             cancelled: false,
             active: true,
             renewal-count: u0,
-            parent-policy-id: none
+            parent-policy-id: none,
+            crop-type: crop-type
         })
         
         (map-set location-claim-history location-key {
@@ -336,6 +353,7 @@
         (location-key {lat: (get latitude policy), lng: (get longitude policy)})
         (current-history (get-location-claim-history (get latitude policy) (get longitude policy)))
         (coverage (get coverage policy))
+        (crop-config (unwrap! (map-get? crop-types (get crop-type policy)) ERR_CROP_TYPE_NOT_FOUND))
     )
         (asserts! (is-eq tx-sender (get farmer policy)) ERR_UNAUTHORIZED)
         (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
@@ -343,7 +361,7 @@
         (asserts! (not (get cancelled policy)) ERR_POLICY_ALREADY_CANCELLED)
         (asserts! (>= stacks-block-height (get start-block policy)) ERR_POLICY_NOT_ACTIVE)
         (asserts! (<= stacks-block-height (get end-block policy)) ERR_POLICY_EXPIRED)
-        (asserts! (or (<= rainfall DROUGHT_THRESHOLD) (>= rainfall FLOOD_THRESHOLD)) ERR_NO_CLAIM_CONDITIONS)
+        (asserts! (or (<= rainfall (get drought-threshold crop-config)) (>= rainfall (get flood-threshold crop-config))) ERR_NO_CLAIM_CONDITIONS)
         
         (if (>= coverage MULTISIG_THRESHOLD)
             (begin
@@ -559,7 +577,8 @@
             cancelled: false,
             active: true,
             renewal-count: new-renewal-count,
-            parent-policy-id: (some policy-id)
+            parent-policy-id: (some policy-id),
+            crop-type: (get crop-type old-policy)
         })
         
         (map-set location-claim-history location-key {
@@ -630,7 +649,7 @@
     )
 )
 
-(define-public (create-pool-policy (pool-id uint) (premium uint) (coverage uint) (duration uint) (lat int) (lng int))
+(define-public (create-pool-policy (pool-id uint) (premium uint) (coverage uint) (duration uint) (lat int) (lng int) (crop-type (string-ascii 20)))
     (let (
         (pool (unwrap! (map-get? community-pools pool-id) ERR_POOL_NOT_FOUND))
         (member-data (unwrap! (get-pool-member pool-id tx-sender) ERR_NOT_POOL_MEMBER))
@@ -642,6 +661,7 @@
         (location-key {lat: lat, lng: lng})
         (current-history (get-location-claim-history lat lng))
     )
+        (asserts! (is-some (map-get? crop-types crop-type)) ERR_CROP_TYPE_NOT_FOUND)
         (asserts! (get active pool) ERR_POOL_NOT_ACTIVE)
         (asserts! (and (>= premium MIN_PREMIUM) (<= premium MAX_PREMIUM)) ERR_INVALID_PARAMS)
         (asserts! (and (>= coverage MIN_COVERAGE) (<= coverage MAX_COVERAGE)) ERR_INVALID_PARAMS)
@@ -661,7 +681,8 @@
             cancelled: false,
             active: true,
             renewal-count: u0,
-            parent-policy-id: none
+            parent-policy-id: none,
+            crop-type: crop-type
         })
         
         (map-set community-pools pool-id (merge pool {
@@ -697,13 +718,14 @@
         (coverage (get coverage policy))
         (location-key {lat: (get latitude policy), lng: (get longitude policy)})
         (current-history (get-location-claim-history (get latitude policy) (get longitude policy)))
+        (crop-config (unwrap! (map-get? crop-types (get crop-type policy)) ERR_CROP_TYPE_NOT_FOUND))
     )
         (asserts! (is-eq tx-sender (get farmer policy)) ERR_UNAUTHORIZED)
         (asserts! (get active policy) ERR_POLICY_NOT_ACTIVE)
         (asserts! (not (get claimed policy)) ERR_POLICY_ALREADY_CLAIMED)
         (asserts! (>= stacks-block-height (get start-block policy)) ERR_POLICY_NOT_ACTIVE)
         (asserts! (<= stacks-block-height (get end-block policy)) ERR_POLICY_EXPIRED)
-        (asserts! (or (<= rainfall DROUGHT_THRESHOLD) (>= rainfall FLOOD_THRESHOLD)) ERR_NO_CLAIM_CONDITIONS)
+        (asserts! (or (<= rainfall (get drought-threshold crop-config)) (>= rainfall (get flood-threshold crop-config))) ERR_NO_CLAIM_CONDITIONS)
         (asserts! (>= (get total-balance pool) coverage) ERR_INSUFFICIENT_POOL_BALANCE)
         
         (try! (as-contract (stx-transfer? coverage tx-sender (get farmer policy))))
